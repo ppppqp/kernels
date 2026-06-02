@@ -135,13 +135,45 @@ def compile_kernel(args):
     return kernel_factory(**kwargs)
 
 
+def module_script(mod):
+    if hasattr(mod, "script"):
+        return mod.script()
+    return str(mod)
+
+
+def get_ir_modules(kernel):
+    artifact = getattr(kernel, "artifact", None)
+    adapter = getattr(kernel, "adapter", None)
+    wrapper = getattr(adapter, "wrapper", None)
+
+    host_mod = (
+        getattr(artifact, "host_mod", None)
+        or getattr(adapter, "host_mod", None)
+        or getattr(wrapper, "host_mod", None)
+    )
+    device_mod = (
+        getattr(artifact, "device_mod", None)
+        or getattr(adapter, "device_mod", None)
+        or getattr(wrapper, "device_mod", None)
+    )
+
+    if host_mod is not None and device_mod is not None:
+        return host_mod, device_mod
+
+    lowered = tilelang.lower(
+        kernel.prim_func,
+        target=getattr(kernel, "target", "auto"),
+        target_host=getattr(kernel, "target_host", None),
+    )
+    return lowered.host_mod, lowered.device_mod
+
+
 def dump_artifacts(kernel, args):
     output_path = args.output_path
     output_path.mkdir(parents=True, exist_ok=True)
 
     kernel_name = f"vector_add_{args.version}"
     artifact = getattr(kernel, "artifact", None)
-    adapter = getattr(kernel, "adapter", None)
     metadata = {
         "kernel": kernel_name,
         "n": args.n,
@@ -157,20 +189,17 @@ def dump_artifacts(kernel, args):
     (output_path / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n")
     (output_path / f"{kernel_name}.prim_func.txt").write_text(str(kernel.prim_func))
 
-    host_mod = getattr(artifact, "host_mod", None) or getattr(adapter, "host_mod", None)
-    device_mod = getattr(artifact, "device_mod", None) or getattr(adapter, "device_mod", None)
-    if host_mod is not None:
-        (output_path / f"{kernel_name}.host_ir.py").write_text(host_mod.script())
-    else:
-        (output_path / f"{kernel_name}.host_ir.not_available.txt").write_text(
-            "host_mod was not available for this TileLang execution backend.\n"
-        )
-    if device_mod is not None:
-        (output_path / f"{kernel_name}.device_ir.py").write_text(device_mod.script())
-    else:
-        (output_path / f"{kernel_name}.device_ir.not_available.txt").write_text(
-            "device_mod was not available for this TileLang execution backend.\n"
-        )
+    for stale_path in output_path.glob(f"{kernel_name}.*_ir.not_available.txt"):
+        stale_path.unlink()
+    for stale_path in output_path.glob(f"{kernel_name}.ir.error.txt"):
+        stale_path.unlink()
+
+    try:
+        host_mod, device_mod = get_ir_modules(kernel)
+        (output_path / f"{kernel_name}.host_ir.py").write_text(module_script(host_mod))
+        (output_path / f"{kernel_name}.device_ir.py").write_text(module_script(device_mod))
+    except Exception as exc:
+        (output_path / f"{kernel_name}.ir.error.txt").write_text(f"{type(exc).__name__}: {exc}\n")
 
     (output_path / f"{kernel_name}.cu").write_text(kernel.get_kernel_source(kernel_only=True))
     (output_path / f"{kernel_name}.host.cc").write_text(kernel.get_host_source())
