@@ -1,1 +1,11 @@
-/**/__pycache__/*
+__pycache__/
+*.py[cod]
+
+# TileLang emitted artifacts
+vector-add/
+*.cu
+*.cc
+*.ptx
+*.sass
+*.txt
+dad
