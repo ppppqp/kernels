@@ -1,11 +1,14 @@
 import argparse
+from contextlib import nullcontext
 import json
 from pathlib import Path
 
 import torch
 import tilelang
 import tilelang.language as T
+from tilelang.contrib import nvcc as tl_nvcc
 from tilelang.profiler import do_bench
+from tilelang.utils.target import determine_target
 
 
 TORCH_DTYPES = {
@@ -120,11 +123,18 @@ def parse_args():
         default=Path("./vector-add"),
         help="Directory where emitted IR, source, PTX, and SASS artifacts are written.",
     )
+    parser.add_argument(
+        "--compile-mode",
+        choices=("jit", "offline"),
+        default="jit",
+        help="Use jit to run/profile, or offline to lower and dump artifacts without launching.",
+    )
+    parser.add_argument("--target", default="cuda", help="TileLang compilation target.")
+    parser.add_argument("--target-host", default=None, help="Optional TileLang host compilation target.")
     return parser.parse_args()
 
 
-def compile_kernel(args):
-    kernel_factory = KERNELS[args.version]
+def kernel_kwargs(args):
     kwargs = {
         "n": args.n,
         "block_size": args.block_size,
@@ -132,7 +142,28 @@ def compile_kernel(args):
     }
     if args.version in {"v2", "v3"}:
         kwargs["num_per_thread"] = args.num_per_thread
-    return kernel_factory(**kwargs)
+    return kwargs
+
+
+def compile_kernel(args):
+    kernel_factory = KERNELS[args.version]
+    return kernel_factory(**kernel_kwargs(args))
+
+
+def get_prim_func(args):
+    kernel_factory = KERNELS[args.version]
+    return kernel_factory.get_tir(**kernel_kwargs(args))
+
+
+def lower_prim_func(prim_func, args):
+    target = determine_target(args.target, return_object=True)
+    target_context = target if hasattr(target, "__enter__") else nullcontext()
+    with target_context:
+        return tilelang.lower(
+            prim_func,
+            target=target,
+            target_host=args.target_host,
+        )
 
 
 def module_script(mod):
@@ -160,11 +191,14 @@ def get_ir_modules(kernel):
     if host_mod is not None and device_mod is not None:
         return host_mod, device_mod
 
-    lowered = tilelang.lower(
-        kernel.prim_func,
-        target=getattr(kernel, "target", "auto"),
-        target_host=getattr(kernel, "target_host", None),
-    )
+    target = getattr(kernel, "target", "auto")
+    target_context = target if hasattr(target, "__enter__") else nullcontext()
+    with target_context:
+        lowered = tilelang.lower(
+            kernel.prim_func,
+            target=target,
+            target_host=getattr(kernel, "target_host", None),
+        )
     return lowered.host_mod, lowered.device_mod
 
 
@@ -213,8 +247,65 @@ def dump_artifacts(kernel, args):
     print(f"Artifacts written to {output_path}")
 
 
+def dump_offline_artifacts(args):
+    output_path = args.output_path
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    kernel_name = f"vector_add_{args.version}"
+    prim_func = get_prim_func(args)
+    artifact = lower_prim_func(prim_func, args)
+    cuda_source = artifact.kernel_source
+    target = determine_target(args.target, return_object=True)
+
+    metadata = {
+        "kernel": kernel_name,
+        "compile_mode": args.compile_mode,
+        "target": args.target,
+        "target_host": args.target_host,
+        "n": args.n,
+        "block_size": args.block_size,
+        "num_per_thread": args.num_per_thread if args.version in {"v2", "v3"} else None,
+        "dtype": args.dtype,
+        "execution_backend": None,
+        "has_artifact": True,
+    }
+
+    (output_path / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n")
+    (output_path / f"{kernel_name}.prim_func.txt").write_text(str(prim_func))
+    (output_path / f"{kernel_name}.host_ir.py").write_text(module_script(artifact.host_mod))
+    (output_path / f"{kernel_name}.device_ir.py").write_text(module_script(artifact.device_mod))
+    (output_path / f"{kernel_name}.cu").write_text(cuda_source)
+
+    for stale_path in output_path.glob(f"{kernel_name}.ptx.error.txt"):
+        stale_path.unlink()
+    for stale_path in output_path.glob(f"{kernel_name}.sass.error.txt"):
+        stale_path.unlink()
+
+    try:
+        with target:
+            (output_path / f"{kernel_name}.ptx").write_text(tl_nvcc.get_ptx_from_source(cuda_source))
+    except Exception as exc:
+        (output_path / f"{kernel_name}.ptx.error.txt").write_text(f"{type(exc).__name__}: {exc}\n")
+
+    try:
+        with target:
+            (output_path / f"{kernel_name}.sass").write_text(tl_nvcc.get_sass_from_source(cuda_source))
+    except Exception as exc:
+        (output_path / f"{kernel_name}.sass.error.txt").write_text(f"{type(exc).__name__}: {exc}\n")
+
+    print(f"Offline artifacts written to {output_path}")
+
+
 def main():
     args = parse_args()
+
+    if args.compile_mode == "offline":
+        dump_offline_artifacts(args)
+        return
+
+    if not torch.cuda.is_available():
+        raise SystemExit("CUDA is required to run and profile this TileLang example.")
+
     torch_dtype = TORCH_DTYPES[args.dtype]
 
     a = torch.randn(args.n, device="cuda", dtype=torch_dtype)
@@ -255,7 +346,4 @@ def main():
 
 
 if __name__ == "__main__":
-    if not torch.cuda.is_available():
-        raise SystemExit("CUDA is required to run this TileLang example.")
-
     main()

@@ -9,3 +9,5 @@ vector-add/
 *.sass
 *.txt
 dad
+metadata.json
+*_ir.py
