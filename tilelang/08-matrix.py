@@ -63,7 +63,7 @@ def tl_gemv(A, B, BLOCK_M: int, BLOCK_K: int):
     C = T.empty((M,), dtype)
 
     # TODO: Implement this function
-    with T.Kernel(M // BLOCK_M) as bx:
+    with T.Kernel(T.ceildiv(M, BLOCK_M), threads=256) as bx:
         A_local = T.alloc_fragment((BLOCK_M, BLOCK_K), dtype)
         B_local = T.alloc_fragment((BLOCK_K), dtype)
         C_local = T.alloc_fragment((BLOCK_M), accum_dtype)
@@ -73,7 +73,8 @@ def tl_gemv(A, B, BLOCK_M: int, BLOCK_K: int):
             T.copy(A[bx * BLOCK_M, k * BLOCK_K], A_local)
             T.copy(B[k * BLOCK_K], B_local)
             for i, j in T.Parallel(BLOCK_M, BLOCK_K):
-                partial_sum[i, j] = A_local[i, j] * B_local[j]
+                # astype is critical
+                partial_sum[i, j] = A_local[i, j].astype(accum_dtype) * B_local[j].astype(accum_dtype)
             T.reduce_sum(partial_sum, C_local, dim=1, clear=False)
         T.copy(C_local, C[bx * BLOCK_M])
         
@@ -163,9 +164,11 @@ def tl_matmul_naive(A, B, BLOCK_M: int, BLOCK_N: int, BLOCK_K: int):
         pid_n,
         pid_m,
     ):
-        acc = T.alloc_fragment((BLOCK_M, BLOCK_N))
+        acc = T.alloc_fragment((BLOCK_M, BLOCK_N), accum_dtype)
         A_local = T.alloc_fragment((BLOCK_M, BLOCK_K), dtype)
         B_local = T.alloc_fragment((BLOCK_K, BLOCK_N), dtype)
+        
+        T.clear(acc)
 
         for k in T.Serial(K // BLOCK_K):
             T.copy(A[pid_m * BLOCK_M, k * BLOCK_K], A_local)
@@ -248,7 +251,23 @@ def tl_matmul_opt(A, B, BLOCK_M: int, BLOCK_N: int, BLOCK_K: int):
     C = T.empty((M, N), dtype)
 
     # TODO: Implement this function
+    with T.Kernel(T.ceildiv(N, BLOCK_N), T.ceildiv(M, BLOCK_M), threads=128) as (
+        pid_n,
+        pid_m,
+    ):
+        acc = T.alloc_fragment((BLOCK_M, BLOCK_N), accum_dtype)
+        A_local = T.alloc_shared((BLOCK_M, BLOCK_K), dtype)
+        B_local = T.alloc_shared((BLOCK_K, BLOCK_N), dtype)
+        
+        T.clear(acc)
 
+        for k in T.Pipelined(K // BLOCK_K, num_stages=3):
+            T.copy(A[pid_m * BLOCK_M, k * BLOCK_K], A_local)
+            T.copy(B[k * BLOCK_K, pid_n * BLOCK_N], B_local)
+
+            T.gemm(A_local, B_local, acc, clear_accum=False)
+            
+        T.copy(acc, C[pid_m * BLOCK_M, pid_n * BLOCK_N]) 
     return C
 
 
@@ -283,6 +302,6 @@ def run_matmul_opt():
 
 
 if __name__ == "__main__":
-    run_gemv()
-    run_matmul_naive()
+    # run_gemv()
+    # run_matmul_naive()
     run_matmul_opt()
