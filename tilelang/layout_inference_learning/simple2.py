@@ -28,14 +28,14 @@ def grouped_attention(Q, K, BLOCK_B: int, BLOCK_S: int, THREADS: int):
     head_num = QB // B
     with T.Kernel(B // BLOCK_B, threads=THREADS) as pid_b:
         Q_local = T.alloc_fragment((BLOCK_B * head_num, BLOCK_S), dtype)
-        T.annotate_layout(
-            {
-                Q_local: T.Fragment(
-                    (BLOCK_B * head_num, BLOCK_S),
-                    lambda i, j: (i % THREADS, (i // THREADS) * BLOCK_S + j),
-                )
-            }
-        )
+        # T.annotate_layout(
+        #     {
+        #         Q_local: T.Fragment(
+        #             (BLOCK_B * head_num, BLOCK_S),
+        #             lambda i, j: (i % THREADS, (i // THREADS) * BLOCK_S + j),
+        #         )
+        #     }
+        # )
         cur_max_QK = T.alloc_fragment([head_num, BLOCK_B], dtype)
         h = 0
         for h in T.Serial(head_num):
@@ -44,10 +44,11 @@ def grouped_attention(Q, K, BLOCK_B: int, BLOCK_S: int, THREADS: int):
                 Q_local[h * BLOCK_B, :],
             )
         Q_local_reshaped = T.reshape(Q_local, (head_num, BLOCK_B, BLOCK_S))
+
         for h, i, j in T.Parallel(head_num, BLOCK_B, BLOCK_S):
-            Q_local_reshaped[h, i, j] - cur_max_QK[h, i]
+            Q_local_reshaped[h, i, j] = cur_max_QK[h, i]
         for h, i in T.Parallel(head_num, BLOCK_B):
-            cur_max_QK[h, i]
+            cur_max_QK[h, i] = Q_local_reshaped[h, i, 0]
     return O
 
 
@@ -56,7 +57,7 @@ def main(*args, **kwargs):
     k = torch.empty((128,))
     BLOCK_B = 16
     BLOCK_S = 32
-    THREADS = 64
+    THREADS = 64  # if head size * BLOCK_B, happened to work
     # grouped_attention.compile(q, k, BLOCK_B, BLOCK_S, THREADS)
     # tir = grouped_attention.get_tir(q, k, BLOCK_B, BLOCK_S, THREADS)
     target_obj = tvm.target.Target("cuda")

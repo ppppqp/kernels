@@ -1,81 +1,60 @@
-import torch
 import tilelang
 import tilelang.language as T
+import tvm
 
 
 @tilelang.jit
-def grouped_attention(Q, K, V, BLOCK_B: int, BLOCK_S: int, THREADS: int):
-    log2_e = 1.44269504
-    QB, B, S = T.const("QB, B, S")
-    dtype = T.float32
-    # the only diff is that shape of Q is QB, S instead of B, S
-    Q: T.Tensor((QB, S), dtype)
-    K: T.Tensor((B, S), dtype)
-    O = T.empty((QB, S), dtype)
+def inner_serial_var_in_thread_mapping(A):
+    A: T.Tensor((8, 4), T.float32)
+    O = T.empty((8, 4), T.float32)
 
-    head_num = QB // B
-    with T.Kernel(B // BLOCK_B, threads=THREADS) as pid_b:
-        Q_local = T.alloc_fragment((BLOCK_B * head_num, BLOCK_S), dtype)
-        K_local = T.alloc_fragment((BLOCK_B, BLOCK_S), dtype)
-        V_local = T.alloc_fragment((BLOCK_B, BLOCK_S), dtype)
-        O_local = T.alloc_fragment((BLOCK_B * head_num, BLOCK_S), dtype)
+    with T.Kernel(1, threads=32):
+        frag = T.alloc_fragment((8, 4), T.float32)
+
+        def frag_layout(i, k):
+            # Force each logical element onto its own thread.
+            #
+            #   frag[i, k] -> thread = i * 4 + k
+            #                 local  = 0
+            #
+            # This is the key difference from the previous example.
+            return i * 4 + k, 0
 
         T.annotate_layout(
-            {
-                Q_local: T.Fragment(
-                    (BLOCK_B * head_num, BLOCK_S),
-                    lambda i, j: (i % THREADS, (i // THREADS) * BLOCK_S + j),
-                )
-            }
+            {frag: T.Fragment((8, 4), forward_fn=lambda i, k: (i * 4 + k, 0))}
         )
-        cur_QK = T.alloc_fragment([head_num, BLOCK_B, BLOCK_S], dtype)
-        cur_exp_QK = T.alloc_fragment([head_num, BLOCK_B, BLOCK_S], dtype)
-        cur_max_QK = T.alloc_fragment([head_num, BLOCK_B], dtype)
-        cur_sum_exp_QK = T.alloc_fragment([head_num, BLOCK_B], dtype)
 
-        lse = T.alloc_fragment([head_num, BLOCK_B], dtype)
+        # Establish/populate frag with the annotated layout.
+        for i, k in T.Parallel(8, 4):
+            frag[i, k] = A[i, k]
 
-        T.fill(lse, -T.infinity(dtype))
-
-        for s_blk_id in T.Serial(S // BLOCK_S):
-            for h in T.Serial(head_num):
-                T.copy(
-                    Q[h * B + pid_b * BLOCK_B, s_blk_id * BLOCK_S],
-                    Q_local[h * BLOCK_B, :],
-                )
-            Q_local_reshaped = T.reshape(Q_local, (head_num, BLOCK_B, BLOCK_S))
-
-            for h, i, j in T.Parallel(head_num, BLOCK_B, BLOCK_S):
-                cur_QK[h, i, j] = Q_local_reshaped[h, i, j] * K_local[i, j]
-
-            T.reduce_max(cur_QK, cur_max_QK, dim=2, clear=True)
-
-            for h, i, j in T.Parallel(head_num, BLOCK_B, BLOCK_S):
-                cur_exp_QK[h, i, j] = T.exp2(
-                    cur_QK[h, i, j] * log2_e - cur_max_QK[h, i] * log2_e
-                )
-
-            T.reduce_sum(cur_exp_QK, cur_sum_exp_QK, dim=2, clear=True)
-
-            for h, i in T.Parallel(head_num, BLOCK_B):
-                lse[h, i] = cur_max_QK[h, i] * log2_e + T.log2(
-                    T.exp2(lse[h, i] - cur_max_QK[h, i] * log2_e) + cur_sum_exp_QK[h, i]
-                )
+        # Problematic loop.
+        #
+        # The parallel loop variables are only:
+        #   i
+        #
+        # But the source fragment layout says:
+        #   thread = i * 4 + k
+        #
+        # After substitution, ComputeLoopLayoutFromBuffer gets:
+        #   loop_var_to_thread = i * 4 + k
+        #
+        # k is from the inner T.Serial loop, so PostOrderVisit should find k in
+        # inner_vars_ and throw LayoutConflictException.
+        for i in T.Parallel(8):
+            for k in T.Serial(4):
+                O[i, k] = frag[i, k]
 
     return O
 
 
 def main():
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    q = torch.empty((512, 512), device=device, dtype=torch.float32)
-    k = torch.empty((256, 512), device=device, dtype=torch.float32)
-    v = torch.empty((256, 512), device=device, dtype=torch.float32)
-    BLOCK_B = 16
-    BLOCK_S = 128
-    THREADS = 256
-    # The failure occurs during TileLang lowering/layout inference, before a
-    # valid CUDA device is required.
-    grouped_attention.compile(q, k, v, BLOCK_B, BLOCK_S, THREADS)
+    target = tvm.target.Target("cuda")
+
+    with target:
+        tir = inner_serial_var_in_thread_mapping.get_tir()
+        tilelang.lower(tir, target=target)
+        print("compiled successfully")
 
 
 if __name__ == "__main__":
